@@ -210,6 +210,26 @@ class AgentThreadActions:
                     f"with error: {error_message} and incomplete details reason: {incomplete_details_reason}"
                 )
 
+            # Check if run is incomplete and may need human clarification
+            if run.status == "incomplete":
+                logger.debug(
+                    f"Run [{run.id}] is incomplete for agent `{agent.name}` and thread `{thread_id}`"
+                )
+                # Handle incomplete run - may require human clarification
+                incomplete_content = await cls._handle_incomplete_run(
+                    agent=agent,
+                    run=run,
+                    thread_id=thread_id,
+                    active_messages={}  # No active messages in non-streaming mode
+                )
+                if incomplete_content:
+                    logger.debug(
+                        f"Yielding incomplete run clarification for agent `{agent.name}` and "
+                        f"thread `{thread_id}`, visibility True"
+                    )
+                    yield True, incomplete_content
+                continue
+
             # Check if function calling is required
             if run.status == "requires_action":
                 if isinstance(run.required_action, SubmitToolOutputsAction):
@@ -723,6 +743,26 @@ class AgentThreadActions:
                             )
                             break
 
+                elif event_type == AgentStreamEvent.THREAD_RUN_INCOMPLETE:
+                    logger.debug(
+                        f"Entering step type {event_type}, agent `{agent.name}` and "
+                        f"thread `{thread_id}` with event data: {event_data}"
+                    )
+                    run = cast(ThreadRun, event_data)
+                    logger.info(f"Run incomplete with ID: {run.id}")
+                    
+                    # Handle incomplete run - this may indicate human clarification is needed
+                    incomplete_content = await cls._handle_incomplete_run(
+                        agent=agent,
+                        run=run,
+                        thread_id=thread_id,
+                        active_messages=active_messages
+                    )
+                    if incomplete_content and output_messages is not None:
+                        output_messages.append(incomplete_content)
+                        yield incomplete_content
+                    return
+
                 elif event_type == AgentStreamEvent.THREAD_RUN_COMPLETED:
                     logger.debug(
                         f"Entering step type {event_type}, agent `{agent.name}` and "
@@ -1030,6 +1070,134 @@ class AgentThreadActions:
                 backoff_time: float = agent.polling_options.message_synchronization_delay.total_seconds() * (2**count)
                 await asyncio.sleep(backoff_time)
         return message
+
+    @classmethod
+    async def _handle_incomplete_run(
+        cls: type[_T],
+        agent: "AzureAIAgent",
+        run: ThreadRun,
+        thread_id: str,
+        active_messages: dict[str, RunStep],
+    ) -> "ChatMessageContent | None":
+        """Handle incomplete run events that may require human clarification.
+        
+        Args:
+            agent: The Azure AI agent.
+            run: The incomplete thread run.
+            thread_id: The thread ID.
+            active_messages: Dictionary of active messages.
+            
+        Returns:
+            ChatMessageContent with clarification request if needed, None otherwise.
+        """
+        from semantic_kernel.agents.azure_ai.agent_content_generation import generate_message_content
+        
+        logger.info(f"Handling incomplete run {run.id} for agent {agent.name}")
+        
+        # Check if this is due to missing required input
+        incomplete_reason = None
+        if run.incomplete_details and hasattr(run.incomplete_details, 'reason'):
+            incomplete_reason = run.incomplete_details.reason
+            logger.debug(f"Incomplete run reason: {incomplete_reason}")
+        
+        # Create a human clarification request message
+        clarification_content = None
+        
+        # First, try to get any existing messages that might provide context
+        if active_messages:
+            for msg_id, step in active_messages.items():
+                message = await cls._retrieve_message(agent=agent, thread_id=thread_id, message_id=msg_id)
+                if message:
+                    # Check if the message content suggests missing information
+                    if hasattr(message, "content") and message.content:
+                        message_text = ""
+                        for content_item in message.content:
+                            if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
+                                message_text += content_item.text.value
+                        
+                        # Generate clarification request based on the incomplete run
+                        clarification_request = cls._generate_clarification_request(
+                            agent_instructions=agent.instructions,
+                            incomplete_reason=incomplete_reason,
+                            partial_response=message_text
+                        )
+                        
+                        # Create the content with clarification metadata
+                        clarification_content = generate_message_content(agent.name, message, step)
+                        if clarification_content and clarification_content.metadata:
+                            clarification_content.metadata.update({
+                                "human_clarification_request": clarification_request,
+                                "requires_clarification": True,
+                                "incomplete_run": True,
+                                "incomplete_reason": str(incomplete_reason) if incomplete_reason else "unknown"
+                            })
+                        break
+        
+        # If no existing messages, create a default clarification request
+        if not clarification_content:
+            clarification_request = cls._generate_clarification_request(
+                agent_instructions=agent.instructions,
+                incomplete_reason=incomplete_reason
+            )
+            
+            clarification_content = ChatMessageContent(
+                role=AuthorRole.ASSISTANT,
+                name=agent.name,
+                content="I need additional information to complete your request. Could you please provide more details?",
+                metadata={
+                    "thread_id": thread_id,
+                    "human_clarification_request": clarification_request,
+                    "requires_clarification": True,
+                    "incomplete_run": True,
+                    "incomplete_reason": str(incomplete_reason) if incomplete_reason else "unknown"
+                }
+            )
+        
+        logger.debug(f"Generated clarification request: {clarification_content.metadata.get('human_clarification_request')}")
+        return clarification_content
+    
+    @classmethod
+    def _generate_clarification_request(
+        cls: type[_T],
+        agent_instructions: str | None = None,
+        incomplete_reason: str | None = None,
+        partial_response: str | None = None
+    ) -> str:
+        """Generate a human-readable clarification request.
+        
+        Args:
+            agent_instructions: The agent's instructions that might provide context.
+            incomplete_reason: The reason the run was incomplete.
+            partial_response: Any partial response that was generated.
+            
+        Returns:
+            A clarification request string.
+        """
+        # Build clarification based on available information
+        clarification_parts = []
+        
+        if incomplete_reason:
+            if "token" in str(incomplete_reason).lower():
+                clarification_parts.append("The response was incomplete due to length limits.")
+            else:
+                clarification_parts.append(f"The request could not be completed ({incomplete_reason}).")
+        
+        # Extract clarification guidance from agent instructions if available
+        if agent_instructions and "clarification" in agent_instructions.lower():
+            # Try to find specific guidance in the instructions
+            lines = agent_instructions.split('\n')
+            for line in lines:
+                if any(keyword in line.lower() for keyword in ['clarification', 'missing', 'required', 'specify']):
+                    if len(line.strip()) > 10:  # Avoid very short lines
+                        clarification_parts.append(line.strip())
+                        break
+        
+        if partial_response and len(partial_response.strip()) > 0:
+            clarification_parts.append("Please provide the missing information to continue.")
+        else:
+            clarification_parts.append("Please provide additional details or clarify your request.")
+        
+        return " ".join(clarification_parts) if clarification_parts else "Please provide more specific information for your request."
 
     @classmethod
     async def _invoke_function_calls(
